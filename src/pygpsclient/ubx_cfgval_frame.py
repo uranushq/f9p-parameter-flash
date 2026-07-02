@@ -12,6 +12,7 @@ Created on 22 Dec 2020
 
 # pylint: disable=no-member
 
+import csv
 from tkinter import (
     EW,
     HORIZONTAL,
@@ -34,6 +35,7 @@ from tkinter import (
     TclError,
     W,
 )
+from tkinter.filedialog import askopenfilename
 
 from PIL import Image, ImageTk
 from pyubx2 import UBX_CONFIG_DATABASE, UBXMessage
@@ -62,6 +64,9 @@ from pygpsclient.helpers import valid_hex
 VALSET = 0
 VALDEL = 1
 VALGET = 2
+# u-blox CFG-VAL* messages allow a maximum of 64 keys per message,
+# so large batches are split into chunks of this size
+MAXKEYS = 64
 ATTDICT = {
     "U": "unsigned int",
     "I": "signed int",
@@ -102,6 +107,7 @@ class UBX_CFGVAL_Frame(Frame):
         self._cfgval_cat = None
         self._cfgval_keyname = None
         self._cfgval_keyid = None
+        self._cfgvals = []  # batch queue of parameters to flash together
         self._cfgmode = IntVar()
         self._cfgatt = StringVar()
         self._cfgkeyid = StringVar()
@@ -193,6 +199,52 @@ class UBX_CFGVAL_Frame(Frame):
             state=READONLY,
             relief="sunken",
         )
+        self._btn_add = Button(
+            self,
+            text="Add",
+            width=5,
+            command=self._on_add,
+            cursor=CLICK_CURSOR,
+        )
+
+        self._lbl_queue = Label(
+            self, text="Batch queue (sent as a single transaction)", anchor=W
+        )
+        self._lbx_queue = Listbox(
+            self,
+            border=2,
+            relief="sunken",
+            height=6,
+            justify=LEFT,
+            exportselection=False,
+        )
+        self._scr_queuev = Scrollbar(self, orient=VERTICAL)
+        self._scr_queueh = Scrollbar(self, orient=HORIZONTAL)
+        self._lbx_queue.config(yscrollcommand=self._scr_queuev.set)
+        self._lbx_queue.config(xscrollcommand=self._scr_queueh.set)
+        self._scr_queuev.config(command=self._lbx_queue.yview)
+        self._scr_queueh.config(command=self._lbx_queue.xview)
+        self._btn_remove = Button(
+            self,
+            text="Remove",
+            width=6,
+            command=self._on_remove,
+            cursor=CLICK_CURSOR,
+        )
+        self._btn_clear = Button(
+            self,
+            text="Clear",
+            width=6,
+            command=self._on_clear,
+            cursor=CLICK_CURSOR,
+        )
+        self._btn_load = Button(
+            self,
+            text="Load CSV",
+            width=6,
+            command=self._on_load_csv,
+            cursor=CLICK_CURSOR,
+        )
 
         self._lbl_send_command = Label(self)
         self._btn_send_command = Button(
@@ -227,13 +279,22 @@ class UBX_CFGVAL_Frame(Frame):
         self._lbl_layer.grid(column=1, row=14, sticky=E)
         self._spn_layer.grid(column=2, row=14, sticky=W)
         self._lbl_val.grid(column=1, row=15, sticky=E)
-        self._ent_val.grid(column=2, row=15, columnspan=3, sticky=EW)
+        self._ent_val.grid(column=2, row=15, columnspan=2, sticky=EW)
+        self._btn_add.grid(column=4, row=15, sticky=EW)
+
+        self._lbl_queue.grid(column=0, row=16, columnspan=5, sticky=EW)
+        self._lbx_queue.grid(column=0, row=17, columnspan=3, rowspan=4, sticky=EW)
+        self._scr_queuev.grid(column=2, row=17, rowspan=4, sticky=(N, S, E))
+        self._scr_queueh.grid(column=0, row=21, columnspan=3, sticky=EW)
+        self._btn_remove.grid(column=3, row=17, columnspan=2, sticky=EW)
+        self._btn_clear.grid(column=3, row=18, columnspan=2, sticky=EW)
+        self._btn_load.grid(column=3, row=19, columnspan=2, sticky=EW)
 
         self._btn_send_command.grid(
-            column=3, row=16, rowspan=2, ipadx=3, ipady=3, sticky=E
+            column=3, row=22, rowspan=2, ipadx=3, ipady=3, sticky=E
         )
         self._lbl_send_command.grid(
-            column=4, row=16, rowspan=2, ipadx=3, ipady=3, sticky=E
+            column=4, row=22, rowspan=2, ipadx=3, ipady=3, sticky=E
         )
         self.option_add("*Font", self.__app.font_sm)
 
@@ -263,6 +324,7 @@ class UBX_CFGVAL_Frame(Frame):
         for i, cat in enumerate(cdb_cats):
             self._lbx_cat.insert(i, cat)
         self._cfgmode.set(2)
+        self._on_clear()
         self._lbl_send_command.config(image=self._img_blank)
 
     def _on_select_mode(self, *args, **kwargs):  # pylint: disable=unused-argument
@@ -274,6 +336,9 @@ class UBX_CFGVAL_Frame(Frame):
             self._ent_val.config(state=NORMAL)
         else:
             self._ent_val.config(state=READONLY)
+        # queued items are mode-specific (SET stores values, DEL/GET store
+        # keys only), so clear the batch when the mode changes
+        self._on_clear()
         self._lbl_send_command.config(image=self._img_blank)
 
     def _on_select_cat(self, *args, **kwargs):  # pylint: disable=unused-argument
@@ -312,44 +377,30 @@ class UBX_CFGVAL_Frame(Frame):
         except TclError:
             pass
 
-    def _on_send_config(self, *args, **kwargs):  # pylint: disable=unused-argument
+    def _parse_current(self):
         """
-        Config interface send button has been clicked.
-        """
+        Parse and validate the currently selected keyname and value entry.
 
-        self._lbl_send_command.config(image=self._img_blank)
-        if self._cfgval_keyname is not None:
-            if self._cfgmode.get() == VALSET:
-                self._do_valset()
-            elif self._cfgmode.get() == VALDEL:
-                self._do_valdel()
-            else:
-                self._do_valget()
+        Used both to add a parameter to the batch queue and to send a
+        single parameter directly. On invalid input the entry is flagged
+        and an error status is shown.
 
-    def _do_valset(self):
-        """
-        Send a CFG-VALSET message.
-
-        :return: valid entry flag
-        :rtype: bool
+        :return: (keyname, value) tuple, or None if invalid
+        :rtype: tuple or None
         """
 
-        valid = True
+        if self._cfgval_keyname is None:
+            return None
         att = atttyp(self._cfgatt.get())
         try:
             atts = attsiz(self._cfgatt.get())
         except ValueError as err:
             self._ent_val.validate(VALNONBLANK)
             self.__container.status_label = (f"INVALID ENTRY - {err}", ERRCOL)
-            return False
+            return None
+
         val = self._cfgval.get()
-        layers = self._cfglayer.get()
-        if layers == "BBR":
-            layers = 2
-        elif layers == "FLASH":
-            layers = 4
-        else:
-            layers = 1
+        valid = True
         try:
             if att in ("C", "X"):  # byte or char
                 valid = self._ent_val.validate(
@@ -366,7 +417,6 @@ class UBX_CFGVAL_Frame(Frame):
                 val = int(val)
                 if val < 0:
                     valid = False
-
             elif att == "L":  # bool
                 self._ent_val.validate(VALBOOL)
                 val = int(val)
@@ -378,21 +428,10 @@ class UBX_CFGVAL_Frame(Frame):
             elif att == "R":  # floating point
                 self._ent_val.validate(VALFLOAT)
                 val = float(val)
-            transaction = 0
-            cfgData = [
-                (self._cfgval_keyname, val),
-            ]
         except ValueError:
             valid = False
 
-        if valid:
-            msg = UBXMessage.config_set(layers, transaction, cfgData)
-            self.__container.send_command(msg)
-            self._lbl_send_command.config(image=self._img_pending)
-            self.__container.status_label = "CFG-VALSET SET message sent"
-            for msgid in ("ACK-ACK", "ACK-NAK"):
-                self.__container.set_pending(msgid, UBX_CFGVAL)
-        else:
+        if not valid:
             self._lbl_send_command.config(image=self._img_warn)
             typ = ATTDICT[att]
             self.__container.status_label = (
@@ -402,56 +441,309 @@ class UBX_CFGVAL_Frame(Frame):
                 ),
                 ERRCOL,
             )
+            return None
 
-        return valid
+        return (self._cfgval_keyname, val)
 
-    def _do_valdel(self):
+    def _on_add(self, *args, **kwargs):  # pylint: disable=unused-argument
         """
-        Send a CFG-VALDEL message.
+        Add the currently selected parameter to the batch queue.
+
+        In CFG-VALSET mode the value is validated and stored; in
+        CFG-VALDEL/GET mode only the keyname is required.
         """
 
-        layers = self._cfglayer.get()
-        if layers == "BBR":
-            layers = 2
-        elif layers == "FLASH":
-            layers = 4
+        layer = self._cfglayer.get() or "RAM"
+        if self._cfgmode.get() == VALSET:
+            parsed = self._parse_current()
+            if parsed is None:
+                return
+            keyname, val = parsed
+            display = f"{layer:6s} {keyname} = {self._cfgval.get()}"
         else:
-            layers = 1
+            if self._cfgval_keyname is None:
+                return
+            keyname, val = self._cfgval_keyname, None
+            display = f"{layer:6s} {keyname}"
+
+        self._cfgvals.append((layer, keyname, val))
+        self._lbx_queue.insert("end", display)
+        self._lbl_send_command.config(image=self._img_blank)
+        self.__container.status_label = (
+            f"{len(self._cfgvals)} parameter(s) queued",
+            OKCOL,
+        )
+
+    def _on_remove(self, *args, **kwargs):  # pylint: disable=unused-argument
+        """
+        Remove the selected parameter(s) from the batch queue.
+        """
+
+        for idx in reversed(self._lbx_queue.curselection()):
+            self._lbx_queue.delete(idx)
+            del self._cfgvals[idx]
+        self._lbl_send_command.config(image=self._img_blank)
+
+    def _on_clear(self, *args, **kwargs):  # pylint: disable=unused-argument
+        """
+        Clear the batch queue.
+        """
+
+        self._cfgvals = []
+        self._lbx_queue.delete(0, "end")
+
+    def _on_load_csv(self, *args, **kwargs):  # pylint: disable=unused-argument
+        """
+        Load a batch of parameters from a CSV file into the queue.
+
+        The CSV must have columns ``layer,key,value`` where layer is one
+        of RAM/BBR/FLASH, key is a pyubx2 config keyname (underscore
+        convention) and value is a decimal or hex (0x..) integer. Loading
+        switches to CFG-VALSET mode and replaces the current queue.
+        """
+
+        fname = askopenfilename(
+            title="Load flash parameter CSV",
+            filetypes=(("CSV files", "*.csv"), ("All files", "*.*")),
+        )
+        if not fname:
+            return
+
+        self._cfgmode.set(VALSET)  # CSV load targets CFG-VALSET (also clears queue)
+        self._on_clear()
+        loaded = 0
+        unknown = 0
+        bad = 0
+        try:
+            with open(fname, "r", encoding="utf-8", newline="") as fcsv:
+                for cells in csv.reader(fcsv):
+                    if not cells or cells[0].strip().startswith("#"):
+                        continue
+                    cells = [c.strip() for c in cells]
+                    if cells[0].lower() == "layer":  # header row
+                        continue
+                    if len(cells) < 3:
+                        bad += 1
+                        continue
+                    layer, key, rawval = cells[0].upper(), cells[1], cells[2]
+                    if layer not in ("RAM", "BBR", "FLASH"):
+                        bad += 1
+                        continue
+                    key = key.replace("-", "_")
+                    if key not in UBX_CONFIG_DATABASE:
+                        unknown += 1
+                        continue
+                    try:
+                        val = self._coerce_value(key, rawval)
+                    except (ValueError, KeyError):
+                        bad += 1
+                        continue
+                    self._cfgvals.append((layer, key, val))
+                    self._lbx_queue.insert("end", f"{layer:6s} {key} = {rawval}")
+                    loaded += 1
+        except OSError as err:
+            self.__container.status_label = (f"Error reading file - {err}", ERRCOL)
+            return
+
+        status = f"Loaded {loaded} parameter(s) from CSV"
+        if unknown:
+            status += f"; {unknown} unknown key(s) skipped"
+        if bad:
+            status += f"; {bad} invalid row(s) skipped"
+        self.__container.status_label = (status, OKCOL if loaded else ERRCOL)
+        self._lbl_send_command.config(image=self._img_blank)
+
+    def _coerce_value(self, keyname: str, rawval: str):
+        """
+        Coerce a CSV value string into the correct type for its keyname.
+
+        :param str keyname: pyubx2 config keyname
+        :param str rawval: value as a decimal or hex string
+        :return: value coerced to int, float or bytes per the parameter type
+        """
+
+        _, att_full = cfgname2key(keyname)
+        att = atttyp(att_full)
+        if att == "R":  # floating point
+            return float(rawval)
+        intval = int(rawval, 16) if rawval.lower().startswith("0x") else int(rawval)
+        if att in ("C", "X"):  # char or byte(s)
+            return int.to_bytes(intval, attsiz(att_full), "little")
+        return intval
+
+    def _on_send_config(self, *args, **kwargs):  # pylint: disable=unused-argument
+        """
+        Config interface send button has been clicked.
+
+        Every parameter in the batch queue is sent, grouped by memory
+        layer and split into chunks of at most ``MAXKEYS`` keys per
+        message. If the queue is empty the currently selected parameter
+        is sent on its own (preserving the original behaviour).
+        """
+
+        self._lbl_send_command.config(image=self._img_blank)
+        mode = self._cfgmode.get()
+
+        if self._cfgvals:
+            cfgvals = list(self._cfgvals)
+        elif self._cfgval_keyname is not None:
+            layer = self._cfglayer.get() or "RAM"
+            if mode == VALSET:
+                parsed = self._parse_current()
+                if parsed is None:
+                    return
+                keyname, val = parsed
+                cfgvals = [(layer, keyname, val)]
+            else:
+                cfgvals = [(layer, self._cfgval_keyname, None)]
+        else:
+            return
+
+        if mode == VALSET:
+            self._do_valset(cfgvals)
+        elif mode == VALDEL:
+            self._do_valdel(cfgvals)
+        else:
+            self._do_valget(cfgvals)
+
+    @staticmethod
+    def _group_by_layer(cfgvals: list) -> dict:
+        """
+        Group queue items by layer, preserving insertion order.
+
+        :param list cfgvals: list of (layer, keyname, value) tuples
+        :return: dict of layer -> list of (keyname, value) tuples
+        :rtype: dict
+        """
+
+        groups = {}
+        for layer, keyname, val in cfgvals:
+            groups.setdefault(layer, []).append((keyname, val))
+        return groups
+
+    @staticmethod
+    def _chunk(seq: list, size: int):
+        """
+        Yield successive ``size``-length chunks of ``seq``.
+        """
+
+        for i in range(0, len(seq), size):
+            yield seq[i : i + size]
+
+    @staticmethod
+    def _layer_setmask(layer: str) -> int:
+        """
+        Return the CFG-VALSET / CFG-VALDEL layer bitmask for a layer name.
+
+        :param str layer: layer name (RAM, BBR or FLASH)
+        :return: layer bitmask (RAM=1, BBR=2, FLASH=4)
+        :rtype: int
+        """
+
+        return {"BBR": 2, "FLASH": 4}.get(layer, 1)
+
+    @staticmethod
+    def _layer_getnum(layer: str) -> int:
+        """
+        Return the CFG-VALGET layer number for a layer name.
+
+        :param str layer: layer name (RAM, BBR, FLASH or DEFAULT)
+        :return: layer number (RAM=0, BBR=1, FLASH=2, DEFAULT=7)
+        :rtype: int
+        """
+
+        return {"BBR": 1, "FLASH": 2, "DEFAULT": 7}.get(layer, 0)
+
+    def _do_valset(self, cfgvals: list):
+        """
+        Send CFG-VALSET message(s) setting one or more parameters.
+
+        Parameters are grouped by layer and split into chunks of at most
+        MAXKEYS keys per message.
+
+        :param list cfgvals: list of (layer, keyname, value) tuples
+        """
+
         transaction = 0
-        key = [
-            self._cfgval_keyname,
-        ]
-        msg = UBXMessage.config_del(layers, transaction, key)
-        self.__container.send_command(msg)
+        nmsg = ntotal = 0
+        for layer, items in self._group_by_layer(cfgvals).items():
+            mask = self._layer_setmask(layer)
+            for chunk in self._chunk(items, MAXKEYS):
+                msg = UBXMessage.config_set(mask, transaction, chunk)
+                self.__container.send_command(msg)
+                nmsg += 1
+                ntotal += len(chunk)
         self._lbl_send_command.config(image=self._img_pending)
-        self.__container.status_label = "CFG-VALDEL SET message sent"
+        self.__container.status_label = (
+            f"CFG-VALSET sent - {ntotal} parameter(s) in {nmsg} message(s)"
+        )
         for msgid in ("ACK-ACK", "ACK-NAK"):
             self.__container.set_pending(msgid, UBX_CFGVAL)
 
-    def _do_valget(self):
+    def _do_valdel(self, cfgvals: list):
         """
-        Send a CFG-VALGET message.
+        Send CFG-VALDEL message(s) deleting one or more parameters.
+
+        :param list cfgvals: list of (layer, keyname, value) tuples
         """
 
-        layers = self._cfglayer.get()
-        if layers == "BBR":
-            layers = 1
-        elif layers == "FLASH":
-            layers = 2
-        elif layers == "DEFAULT":
-            layers = 7
-        else:
-            layers = 0
         transaction = 0
-        keys = [
-            self._cfgval_keyname,
-        ]
-        msg = UBXMessage.config_poll(layers, transaction, keys)
-        self.__container.send_command(msg)
+        nmsg = ntotal = 0
+        for layer, items in self._group_by_layer(cfgvals).items():
+            mask = self._layer_setmask(layer)
+            keys = [key for key, _ in items]
+            for chunk in self._chunk(keys, MAXKEYS):
+                msg = UBXMessage.config_del(mask, transaction, chunk)
+                self.__container.send_command(msg)
+                nmsg += 1
+                ntotal += len(chunk)
         self._lbl_send_command.config(image=self._img_pending)
-        self.__container.status_label = "CFG-VALGET POLL message sent"
+        self.__container.status_label = (
+            f"CFG-VALDEL sent - {ntotal} parameter(s) in {nmsg} message(s)"
+        )
+        for msgid in ("ACK-ACK", "ACK-NAK"):
+            self.__container.set_pending(msgid, UBX_CFGVAL)
+
+    def _do_valget(self, cfgvals: list):
+        """
+        Send CFG-VALGET message(s) polling one or more parameters.
+
+        :param list cfgvals: list of (layer, keyname, value) tuples
+        """
+
+        transaction = 0
+        nmsg = ntotal = 0
+        for layer, items in self._group_by_layer(cfgvals).items():
+            num = self._layer_getnum(layer)
+            keys = [key for key, _ in items]
+            for chunk in self._chunk(keys, MAXKEYS):
+                msg = UBXMessage.config_poll(num, transaction, chunk)
+                self.__container.send_command(msg)
+                nmsg += 1
+                ntotal += len(chunk)
+        self._lbl_send_command.config(image=self._img_pending)
+        self.__container.status_label = (
+            f"CFG-VALGET sent - {ntotal} parameter(s) in {nmsg} message(s)"
+        )
         for msgid in ("CFG-VALGET", "ACK-ACK", "ACK-NAK"):
             self.__container.set_pending(msgid, UBX_CFGVAL)
+
+    def _format_getval(self, keyname: str, val) -> str:
+        """
+        Format a value returned by CFG-VALGET for display.
+
+        :param str keyname: configuration keyname
+        :param val: returned value
+        :return: display string
+        :rtype: str
+        """
+
+        if isinstance(val, bytes):
+            _, att = cfgname2key(keyname)
+            atts = attsiz(att)
+            vali = int.from_bytes(val, "little")
+            return f"0x{vali:0{atts*2}x}"
+        return val
 
     def update_status(self, msg: UBXMessage):  # pylint: disable=unused-argument
         """
@@ -462,13 +754,20 @@ class UBX_CFGVAL_Frame(Frame):
 
         if msg.identity == "CFG-VALGET":
             self._lbl_send_command.config(image=self._img_confirmed)
-            val = getattr(msg, self._cfgval_keyname, None)
-            if val is not None:
-                if isinstance(val, bytes):
-                    atts = attsiz(self._cfgatt.get())
-                    vali = int.from_bytes(val, "little")
-                    val = f"0x{vali:0{atts*2}x}"
-                self._cfgval.set(val)
+            # populate value entry for the currently selected keyname
+            if self._cfgval_keyname is not None:
+                val = getattr(msg, self._cfgval_keyname, None)
+                if val is not None:
+                    self._cfgval.set(self._format_getval(self._cfgval_keyname, val))
+            # populate returned values against any queued keynames
+            for i, (layer, keyname, _) in enumerate(self._cfgvals):
+                val = getattr(msg, keyname, None)
+                if val is not None:
+                    self._lbx_queue.delete(i)
+                    self._lbx_queue.insert(
+                        i,
+                        f"{layer:6s} {keyname} = {self._format_getval(keyname, val)}",
+                    )
             self.__container.status_label = ("CFG-VALGET GET message received", OKCOL)
 
         elif msg.identity == "ACK-ACK":
