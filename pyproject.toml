@@ -60,6 +60,7 @@ dependencies = [
 
 [project.scripts]
 pygpsclient = "pygpsclient.__main__:main"
+ucenter2csv = "pygpsclient.ucenter_config:main"
 
 [project.urls]
 homepage = "https://github.com/semuconsulting/PyGPSClient"
